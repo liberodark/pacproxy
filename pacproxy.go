@@ -34,6 +34,8 @@ var (
 	fUpstreamUser     string
 	fUpstreamPassFile string
 	fUpstreamAuthHost string
+	fDNS              string
+	fDNSSearch        string
 )
 
 func init() {
@@ -44,6 +46,8 @@ func init() {
 	flag.StringVar(&fUpstreamUser, "upstream-user", "", "Username for upstream proxy Basic authentication")
 	flag.StringVar(&fUpstreamPassFile, "upstream-password-file", "", "File containing the upstream proxy password")
 	flag.StringVar(&fUpstreamAuthHost, "upstream-auth-hosts", "", "Comma-separated list of upstream hosts (with optional :port) that should receive Proxy-Authorization. Empty means all.")
+	flag.StringVar(&fDNS, "dns", "", "Comma-separated list of DNS server IPs (with optional :port) to use instead of the system resolver. Empty = use system DNS.")
+	flag.StringVar(&fDNSSearch, "dns-search", "", "Comma-separated list of DNS search domains appended to unqualified hostnames. Only used when -dns is set.")
 }
 
 func main() {
@@ -150,6 +154,29 @@ func listen(otto *pac.OttoEngine) {
 		exitWithUsage("-upstream-auth-hosts requires -upstream-user")
 	}
 
+	var dnsServers, dnsSearch []string
+	if fDNS != "" {
+		for _, s := range strings.Split(fDNS, ",") {
+			if s = strings.TrimSpace(s); s != "" {
+				dnsServers = append(dnsServers, s)
+			}
+		}
+	}
+	if fDNSSearch != "" {
+		for _, d := range strings.Split(fDNSSearch, ",") {
+			if d = strings.TrimSpace(d); d != "" {
+				dnsSearch = append(dnsSearch, d)
+			}
+		}
+	}
+	if len(dnsServers) == 0 && len(dnsSearch) > 0 {
+		exitWithUsage("-dns-search requires -dns")
+	}
+	resolver := newCustomResolver(dnsServers, dnsSearch)
+	if resolver != nil {
+		log.Printf("Custom DNS resolver enabled: servers=%v search=%v", dnsServers, dnsSearch)
+	}
+
 	srv := &http.Server{
 		Addr:              fListen,
 		ReadHeaderTimeout: 2 * time.Second,
@@ -159,6 +186,7 @@ func listen(otto *pac.OttoEngine) {
 			&pac.FirstItemSelector{},
 			newNonProxyHTTPHandler(),
 			upstreamCreds,
+			resolver,
 		),
 	}
 	log.Printf("Listening on %q", fListen)

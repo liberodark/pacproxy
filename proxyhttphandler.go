@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"crypto/tls"
 	"encoding/base64"
 	"errors"
@@ -66,6 +67,7 @@ type proxyHTTPHandler struct {
 	proxySelector   pac.ProxySelector
 	httpClient      *http.Client
 	dialer          *net.Dialer
+	resolver        *customResolver
 	nonProxyHandler http.Handler
 	upstreamAuth    *upstreamAuth
 }
@@ -75,10 +77,15 @@ func newProxyHTTPHandler(
 	proxySelector pac.ProxySelector,
 	nonProxyHandler http.Handler,
 	upstreamAuth *upstreamAuth,
+	resolver *customResolver,
 ) *proxyHTTPHandler {
 	dialer := &net.Dialer{
 		Timeout:   10 * time.Second,
 		KeepAlive: 10 * time.Second,
+	}
+	dialContext := dialer.DialContext
+	if resolver != nil {
+		dialContext = resolver.dialContext(dialer)
 	}
 	transport := &http.Transport{
 		DisableKeepAlives:     false,
@@ -90,7 +97,7 @@ func newProxyHTTPHandler(
 		ExpectContinueTimeout: 1 * time.Second,
 		TLSHandshakeTimeout:   10 * time.Second,
 		Proxy:                 nil,
-		DialContext:           dialer.DialContext,
+		DialContext:           dialContext,
 	}
 	handler := &proxyHTTPHandler{
 		proxyFinder:   proxyFinder,
@@ -104,11 +111,27 @@ func newProxyHTTPHandler(
 			Jar: nil,
 		},
 		dialer:          dialer,
+		resolver:        resolver,
 		nonProxyHandler: nonProxyHandler,
 		upstreamAuth:    upstreamAuth,
 	}
 	transport.Proxy = handler.lookupProxy
 	return handler
+}
+
+func (h *proxyHTTPHandler) resolveAddr(ctx context.Context, hostPort string) (string, error) {
+	if h.resolver == nil {
+		return hostPort, nil
+	}
+	return h.resolver.resolveHost(ctx, hostPort)
+}
+
+func (h *proxyHTTPHandler) dialTCP(ctx context.Context, hostPort string) (net.Conn, error) {
+	addr, err := h.resolveAddr(ctx, hostPort)
+	if err != nil {
+		return nil, err
+	}
+	return h.dialer.DialContext(ctx, "tcp", addr)
 }
 
 func (h *proxyHTTPHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -166,7 +189,7 @@ func (h *proxyHTTPHandler) doConnectProxy(w http.ResponseWriter, r *http.Request
 	}
 
 	if proxyURL == nil {
-		serverConn, err = h.dialer.Dial("tcp", r.URL.Host)
+		serverConn, err = h.dialTCP(r.Context(), r.URL.Host)
 		if err != nil {
 			log.Printf("HTTP Connect Proxy %q: %d %s", r.URL, http.StatusBadGateway, err)
 			http.Error(w, err.Error(), http.StatusBadGateway)
@@ -175,12 +198,18 @@ func (h *proxyHTTPHandler) doConnectProxy(w http.ResponseWriter, r *http.Request
 		defer serverConn.Close()
 	} else {
 		hostPort := proxyURL.Hostname() + ":" + proxyURL.Port()
+		resolved, rerr := h.resolveAddr(r.Context(), hostPort)
+		if rerr != nil {
+			log.Printf("HTTP Connect Proxy %q: %d %s", r.URL, http.StatusBadGateway, rerr)
+			http.Error(w, rerr.Error(), http.StatusBadGateway)
+			return
+		}
 		if proxyURL.Scheme == "https" {
-			serverConn, err = tls.DialWithDialer(h.dialer, "tcp", hostPort, &tls.Config{
+			serverConn, err = tls.DialWithDialer(h.dialer, "tcp", resolved, &tls.Config{
 				ServerName: proxyURL.Hostname(),
 			})
 		} else {
-			serverConn, err = h.dialer.Dial("tcp", hostPort)
+			serverConn, err = h.dialer.Dial("tcp", resolved)
 		}
 		if err != nil {
 			log.Printf("HTTP Connect Proxy %q: %d %s", r.URL, http.StatusBadGateway, err)
