@@ -27,10 +27,13 @@ const About = "A no-frills local HTTP proxy server powered by a proxy auto-confi
 const Repo = "https://github.com/williambailey/pacproxy"
 
 var (
-	fPac        string
-	fListen     string
-	fVerbose    bool
-	fResolveURL string
+	fPac              string
+	fListen           string
+	fVerbose          bool
+	fResolveURL       string
+	fUpstreamUser     string
+	fUpstreamPassFile string
+	fUpstreamAuthHost string
 )
 
 func init() {
@@ -38,6 +41,9 @@ func init() {
 	flag.StringVar(&fListen, "l", "127.0.0.1:8080", "Interface and port to listen on")
 	flag.BoolVar(&fVerbose, "v", false, "send verbose output to STDERR")
 	flag.StringVar(&fResolveURL, "r", "", "Resolve the proxies for the provided url to STDOUT and exit")
+	flag.StringVar(&fUpstreamUser, "upstream-user", "", "Username for upstream proxy Basic authentication")
+	flag.StringVar(&fUpstreamPassFile, "upstream-password-file", "", "File containing the upstream proxy password")
+	flag.StringVar(&fUpstreamAuthHost, "upstream-auth-hosts", "", "Comma-separated list of upstream hosts (with optional :port) that should receive Proxy-Authorization. Empty means all.")
 }
 
 func main() {
@@ -110,6 +116,40 @@ func do_resolve(otto *pac.OttoEngine) {
 }
 
 func listen(otto *pac.OttoEngine) {
+	var upstreamCreds *upstreamAuth
+	if fUpstreamUser != "" {
+		if fUpstreamPassFile == "" {
+			exitWithUsage("-upstream-user requires -upstream-password-file")
+		}
+		raw, err := os.ReadFile(fUpstreamPassFile)
+		if err != nil {
+			log.Panicf("unable to read upstream password file %q: %s", fUpstreamPassFile, err)
+		}
+		pass := strings.TrimRight(string(raw), "\r\n\t ")
+		if pass == "" {
+			log.Panicf("upstream password file %q is empty", fUpstreamPassFile)
+		}
+		var hosts []string
+		if fUpstreamAuthHost != "" {
+			for _, h := range strings.Split(fUpstreamAuthHost, ",") {
+				h = strings.TrimSpace(strings.ToLower(h))
+				if h != "" {
+					hosts = append(hosts, h)
+				}
+			}
+		}
+		upstreamCreds = &upstreamAuth{user: fUpstreamUser, pass: pass, hosts: hosts}
+		if len(hosts) > 0 {
+			log.Printf("Upstream Basic auth enabled for user %q, restricted to hosts %v", fUpstreamUser, hosts)
+		} else {
+			log.Printf("Upstream Basic auth configured for user %q but no -upstream-auth-hosts set: credentials will NOT be sent anywhere", fUpstreamUser)
+		}
+	} else if fUpstreamPassFile != "" {
+		exitWithUsage("-upstream-password-file requires -upstream-user")
+	} else if fUpstreamAuthHost != "" {
+		exitWithUsage("-upstream-auth-hosts requires -upstream-user")
+	}
+
 	srv := &http.Server{
 		Addr:              fListen,
 		ReadHeaderTimeout: 2 * time.Second,
@@ -118,6 +158,7 @@ func listen(otto *pac.OttoEngine) {
 			otto,
 			&pac.FirstItemSelector{},
 			newNonProxyHTTPHandler(),
+			upstreamCreds,
 		),
 	}
 	log.Printf("Listening on %q", fListen)
